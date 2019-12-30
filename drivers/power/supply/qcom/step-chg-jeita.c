@@ -75,6 +75,7 @@ struct step_chg_info {
 	struct power_supply	*batt_psy;
 	struct power_supply	*bms_psy;
 	struct power_supply	*usb_psy;
+	struct power_supply	*main_psy;
 	struct power_supply	*dc_psy;
 	struct delayed_work	status_change_work;
 	struct delayed_work	get_config_work;
@@ -264,6 +265,11 @@ static int get_step_chg_jeita_setting_from_profile(struct step_chg_info *chip)
 
 	profile_node = of_batterydata_get_best_profile(batt_node,
 					batt_id_ohms / 1000, NULL);
+	if (profile_node == NULL) {
+		pr_err("profile_node is null, get one more.\n");
+		profile_node = of_batterydata_get_best_profile(batt_node,
+					batt_id_ohms / 1000, NULL);
+	}
 	if (IS_ERR(profile_node))
 		return PTR_ERR(profile_node);
 
@@ -721,6 +727,11 @@ set_jeita_fv:
 
 update_time:
 	chip->jeita_last_update_time = ktime_get();
+
+	if (!chip->main_psy)
+		chip->main_psy = power_supply_get_by_name("main");
+	if (chip->main_psy)
+		power_supply_changed(chip->main_psy);
 
 	return 0;
 }

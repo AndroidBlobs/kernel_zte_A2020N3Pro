@@ -41,7 +41,9 @@
 #include "qg-battery-profile.h"
 #include "qg-defs.h"
 
-static int qg_debug_mask;
+static int qg_debug_mask =
+	QG_DEBUG_ESR | QG_DEBUG_ALG_CL | QG_DEBUG_PM | QG_DEBUG_SOC |
+	QG_DEBUG_IRQ | QG_DEBUG_STATUS | QG_DEBUG_DEVICE | QG_DEBUG_PROFILE | QG_DEBUG_PON;
 module_param_named(
 	debug_mask, qg_debug_mask, int, 0600
 );
@@ -2861,13 +2863,11 @@ use_pon_ocv:
 			goto done;
 		}
 
-		if ((full_soc > cutoff_soc) && (pon_soc > cutoff_soc)) {
+		if ((full_soc > cutoff_soc) && (pon_soc > cutoff_soc))
 			soc = DIV_ROUND_UP(((pon_soc - cutoff_soc) * 100),
 						(full_soc - cutoff_soc));
-			soc = CAP(0, 100, soc);
-		} else {
+		else
 			soc = pon_soc;
-		}
 
 		qg_dbg(chip, QG_DEBUG_PON, "v_float=%d v_cutoff=%d FULL_SOC=%d CUTOFF_SOC=%d PON_SYS_SOC=%d pon_soc=%d\n",
 			chip->bp.float_volt_uv, chip->dt.vbatt_cutoff_mv * 1000,

@@ -284,6 +284,9 @@ int get_effective_result(struct votable *votable)
 {
 	int value;
 
+	if (!votable) {
+		return -EINVAL;
+	}
 	lock_votable(votable);
 	value = get_effective_result_locked(votable);
 	unlock_votable(votable);
