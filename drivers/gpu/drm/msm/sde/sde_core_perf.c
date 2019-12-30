@@ -215,6 +215,7 @@ int sde_core_perf_crtc_check(struct drm_crtc *crtc,
 		return 0;
 	}
 
+
 	sde_cstate = to_sde_crtc_state(state);
 
 	/* obtain new values */

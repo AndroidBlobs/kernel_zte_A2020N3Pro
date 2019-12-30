@@ -79,6 +79,7 @@ struct dp_display_private {
 
 	struct platform_device *pdev;
 	struct device_node *aux_switch_node;
+	struct device_node *ssusb_redriver_node;
 	struct dentry *root;
 	struct completion notification_comp;
 
@@ -105,8 +106,6 @@ struct dp_display_private {
 	struct work_struct connect_work;
 	struct work_struct attention_work;
 	struct mutex session_lock;
-	bool suspended;
-	bool hdcp_delayed_off;
 
 	u32 active_stream_cnt;
 	struct dp_mst mst;
@@ -341,19 +340,6 @@ static void dp_display_hdcp_cb_work(struct work_struct *work)
 
 	if (!dp->power_on || !dp->is_connected || atomic_read(&dp->aborted))
 		return;
-
-	if (dp->suspended) {
-		pr_debug("System suspending. Delay HDCP operations\n");
-		queue_delayed_work(dp->wq, &dp->hdcp_cb_work, HZ);
-		return;
-	}
-
-	if (dp->hdcp_delayed_off) {
-		if (dp->hdcp.ops && dp->hdcp.ops->off)
-			dp->hdcp.ops->off(dp->hdcp.data);
-		dp_display_update_hdcp_status(dp, true);
-		dp->hdcp_delayed_off = false;
-	}
 
 	drm_dp_dpcd_readb(dp->aux->drm_aux, DP_SINK_STATUS, &sink_status);
 	sink_status &= (DP_RECEIVE_PORT_0_STATUS | DP_RECEIVE_PORT_1_STATUS);
@@ -967,7 +953,9 @@ static void dp_display_clean(struct dp_display_private *dp)
 
 	dp->power_on = false;
 
+	mutex_lock(&dp->session_lock);
 	dp->ctrl->off(dp->ctrl);
+	mutex_unlock(&dp->session_lock);
 }
 
 static int dp_display_handle_disconnect(struct dp_display_private *dp)
@@ -1311,6 +1299,11 @@ static int dp_init_sub_modules(struct dp_display_private *dp)
 		goto error_aux;
 	}
 
+	if (dp->ssusb_redriver_node) {
+		set_alternative_aux_switch_node(dp->aux,
+			dp->ssusb_redriver_node);
+	}
+
 	rc = dp->aux->drm_aux_register(dp->aux);
 	if (rc) {
 		pr_err("DRM DP AUX register failed\n");
@@ -1389,7 +1382,6 @@ static int dp_init_sub_modules(struct dp_display_private *dp)
 	debug_in.catalog = dp->catalog;
 	debug_in.parser = dp->parser;
 	debug_in.ctrl = dp->ctrl;
-	debug_in.power = dp->power;
 
 	dp->debug = dp_debug_get(&debug_in);
 	if (IS_ERR(dp->debug)) {
@@ -1733,13 +1725,6 @@ static int dp_display_pre_disable(struct dp_display *dp_display, void *panel)
 
 	if (dp_display_is_hdcp_enabled(dp) &&
 			status->hdcp_state != HDCP_STATE_INACTIVE) {
-
-		if (dp->suspended) {
-			pr_debug("Can't perform HDCP cleanup while suspended. Defer\n");
-			dp->hdcp_delayed_off = true;
-			goto stream;
-		}
-
 		flush_delayed_work(&dp->hdcp_cb_work);
 		if (dp->mst.mst_active) {
 			dp_display_hdcp_deregister_stream(dp,
@@ -2136,6 +2121,12 @@ static int dp_display_init_aux_switch(struct dp_display_private *dp)
 	if (!dp->aux_switch_node) {
 		pr_warn("cannot parse %s handle\n", phandle);
 		goto end;
+	}
+
+	dp->ssusb_redriver_node = of_parse_phandle(dp->pdev->dev.of_node,
+			"qcom,ssusb-redriver-aux-switch", 0);
+	if (!dp->ssusb_redriver_node) {
+		pr_warn("cannot parse qcom,ssusb-redriver-aux-switch handle\n");
 	}
 
 	nb.notifier_call = dp_display_fsa4480_callback;
@@ -2622,24 +2613,14 @@ static int dp_display_remove(struct platform_device *pdev)
 
 static int dp_pm_prepare(struct device *dev)
 {
-	struct dp_display_private *dp = container_of(g_dp_display,
-			struct dp_display_private, dp_display);
-
 	dp_display_set_mst_state(g_dp_display, PM_SUSPEND);
-
-	dp->suspended = true;
 
 	return 0;
 }
 
 static void dp_pm_complete(struct device *dev)
 {
-	struct dp_display_private *dp = container_of(g_dp_display,
-			struct dp_display_private, dp_display);
-
 	dp_display_set_mst_state(g_dp_display, PM_DEFAULT);
-
-	dp->suspended = false;
 }
 
 static const struct dev_pm_ops dp_pm_ops = {
