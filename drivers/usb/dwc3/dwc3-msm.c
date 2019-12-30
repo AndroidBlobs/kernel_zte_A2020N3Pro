@@ -323,6 +323,10 @@ struct dwc3_msm {
 	u32			*gsi_reg;
 	int			gsi_reg_offset_cnt;
 
+	/* Usb online lpm test requirement, 1/5 */
+	struct class *lpm_test_class;
+	struct device *lpm_test_dev;
+
 	struct notifier_block	dpdm_nb;
 	struct regulator	*dpdm_reg;
 
@@ -936,11 +940,6 @@ static int gsi_startxfer_for_ep(struct usb_ep *ep)
 	struct dwc3_ep *dep = to_dwc3_ep(ep);
 	struct dwc3	*dwc = dep->dwc;
 
-	if (!(dep->flags & DWC3_EP_ENABLED)) {
-		dbg_log_string("ep:%s disabled\n", ep->name);
-		return -ESHUTDOWN;
-	}
-
 	memset(&params, 0, sizeof(params));
 	params.param0 = GSI_TRB_ADDR_BIT_53_MASK | GSI_TRB_ADDR_BIT_55_MASK;
 	params.param0 |= (ep->ep_intr_num << 16);
@@ -1115,11 +1114,6 @@ static int gsi_prepare_trbs(struct usb_ep *ep, struct usb_gsi_request *req)
 					: (req->num_bufs + 2);
 	struct scatterlist *sg;
 	struct sg_table *sgt;
-
-	if (!(dep->flags & DWC3_EP_ENABLED)) {
-		dbg_log_string("ep:%s disabled\n", ep->name);
-		return -ESHUTDOWN;
-	}
 
 	dep->trb_pool = dma_zalloc_coherent(dwc->sysdev,
 				num_trbs * sizeof(struct dwc3_trb),
@@ -3093,6 +3087,71 @@ static void check_for_sdp_connection(struct work_struct *w)
 	}
 }
 
+/* Usb online lpm test requirement, 2/5 */
+static bool forge_usb_offline = 0;
+
+static ssize_t set_usb_online_fn(struct device *dev,
+						struct device_attribute *attr,
+						const char *buf, size_t count)
+{
+	int online;
+	struct dwc3_msm *mdwc = dev_get_drvdata(dev);
+
+	if (kstrtoint(buf, 10, &online) < 0)
+		return -EINVAL;
+
+	online = !!online;
+	pr_info("%s, online : %d\n", __func__, online);
+
+	mdwc->vbus_active = online;
+	dwc3_ext_event_notify(mdwc);
+
+	forge_usb_offline = !online;
+
+	return count;
+}
+
+static DEVICE_ATTR(set_usb_online, S_IWUSR, NULL, set_usb_online_fn);
+
+static struct device_attribute *lpm_test_attributes[] = {
+	&dev_attr_set_usb_online,
+	NULL
+};
+
+static int lpm_test_create_device(struct dwc3_msm *motg)
+{
+	struct device_attribute **attrs = lpm_test_attributes;
+	struct device_attribute *attr;
+	struct dwc3 *dwc = platform_get_drvdata(motg->dwc3);
+	int err;
+
+	if (dwc->core_id == 0)
+		pr_info("%s\n", __func__);
+	else
+		return 0;
+
+	motg->lpm_test_class = class_create(THIS_MODULE, "charger");
+	if (IS_ERR(motg->lpm_test_class))
+		return PTR_ERR(motg->lpm_test_class);
+
+	motg->lpm_test_dev = device_create(motg->lpm_test_class, NULL, 0, NULL, "test");
+	if (IS_ERR(motg->lpm_test_dev))
+		return PTR_ERR(motg->lpm_test_dev);
+
+	dev_set_drvdata(motg->lpm_test_dev, motg);
+
+	while ((attr = *attrs++)) {
+		err = device_create_file(motg->lpm_test_dev, attr);
+		if (err) {
+			device_destroy(motg->lpm_test_class, 0);
+			return err;
+		}
+	}
+	return 0;
+}
+
+
+
 static int dwc3_msm_vbus_notifier(struct notifier_block *nb,
 	unsigned long event, void *ptr)
 {
@@ -3100,6 +3159,10 @@ static int dwc3_msm_vbus_notifier(struct notifier_block *nb,
 	struct extcon_dev *edev = ptr;
 	struct extcon_nb *enb = container_of(nb, struct extcon_nb, vbus_nb);
 	struct dwc3_msm *mdwc = enb->mdwc;
+
+	/* Usb online lpm test requirement, 3/5 */
+	if (forge_usb_offline)
+		forge_usb_offline = 0;
 
 	if (!edev || !mdwc)
 		return NOTIFY_DONE;
@@ -3792,6 +3855,12 @@ static int dwc3_msm_probe(struct platform_device *pdev)
 	device_create_file(&pdev->dev, &dev_attr_usb_compliance_mode);
 	device_create_file(&pdev->dev, &dev_attr_bus_vote);
 
+	/* Usb online lpm test requirement, 4/5 */
+	ret = lpm_test_create_device(mdwc);
+	if (ret) {
+		dev_err(&pdev->dev, "fail to setup lpm_test_device\n");
+	}
+
 	return 0;
 
 put_dwc3:
@@ -4174,6 +4243,26 @@ static void dwc3_override_vbus_status(struct dwc3_msm *mdwc, bool vbus_present)
 }
 
 /**
+ * dwc3_uevent -  notify usb peripheral's on/off state to userspace.
+ *
+ * @mdwc: Pointer to the dwc3_msm structure.
+ * @on:   Turn ON/OFF the gadget.
+ */
+static void dwc3_uevent(struct dwc3_msm *mdwc, int state)
+{
+	char *online[2] = { "USB_STATE=ONLINE", NULL };
+	char *offline[2] = { "USB_STATE=OFFLINE", NULL };
+	char **uevent_envp = NULL;
+
+	uevent_envp = state ? online : offline;
+
+	if (uevent_envp && mdwc->lpm_test_dev) {
+		pr_info("%s: sent uevent %s\n", __func__, uevent_envp[0]);
+		kobject_uevent_env(&mdwc->lpm_test_dev->kobj, KOBJ_CHANGE, uevent_envp);
+	}
+}
+
+/**
  * dwc3_otg_start_peripheral -  bind/unbind the peripheral controller.
  *
  * @mdwc: Pointer to the dwc3_msm structure.
@@ -4250,6 +4339,9 @@ static int dwc3_otg_start_peripheral(struct dwc3_msm *mdwc, int on)
 		set_bit(WAIT_FOR_LPM, &mdwc->inputs);
 	}
 
+	/* notify usb peripheral's on/off state to userspace */
+	dwc3_uevent(mdwc, on);
+
 	pm_runtime_put_sync(mdwc->dev);
 	dbg_event(0xFF, "StopGdgt psync",
 		atomic_read(&mdwc->dev->power.usage_count));
@@ -4306,6 +4398,10 @@ static int get_psy_type(struct dwc3_msm *mdwc)
 
 	if (mdwc->charging_disabled)
 		return -EINVAL;
+
+	/* Usb online lpm test requirement, 5/5 */
+	if (forge_usb_offline)
+		return 0;
 
 	if (!mdwc->usb_psy) {
 		mdwc->usb_psy = power_supply_get_by_name("usb");
@@ -4387,7 +4483,11 @@ static void dwc3_otg_sm_work(struct work_struct *w)
 		return;
 	}
 
+	dev_info(mdwc->dev, "dwc3 drd_state = %d, inputs = %lx\n",
+		mdwc->drd_state, mdwc->inputs);
+		
 	state = dwc3_drd_state_string(mdwc->drd_state);
+
 	dev_dbg(mdwc->dev, "%s state\n", state);
 	dbg_event(0xFF, state, 0);
 
