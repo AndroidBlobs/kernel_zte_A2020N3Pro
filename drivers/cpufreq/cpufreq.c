@@ -31,9 +31,9 @@
 #include <linux/syscore_ops.h>
 #include <linux/tick.h>
 #include <linux/sched/topology.h>
-#include <linux/sched/sysctl.h>
 
 #include <trace/events/power.h>
+#include <linux/mm.h>
 
 static LIST_HEAD(cpufreq_policy_list);
 
@@ -642,6 +642,28 @@ static int cpufreq_parse_governor(char *str_governor, unsigned int *policy,
 	return err;
 }
 
+static int get_process_name(char *procname, int len)
+{
+	struct pid *pid = NULL;
+	struct task_struct *task = NULL;
+	int nr = task_tgid_vnr(current);
+
+	pid = find_get_pid(nr);
+	if (pid) {
+		task = get_pid_task(pid, PIDTYPE_PID);
+		put_pid(pid);
+		if (task) {
+			get_cmdline(task, procname, len);
+			put_task_struct(task);
+			return 0;
+		}
+	}
+	return -EINVAL;
+}
+
+
+
+
 /**
  * cpufreq_per_cpu_attr_read() / show_##file_name() -
  * print out cpufreq information
@@ -649,6 +671,51 @@ static int cpufreq_parse_governor(char *str_governor, unsigned int *policy,
  * Write out information from cpufreq_driver->policy[cpu]; object must be
  * "unsigned int".
  */
+
+/* Please add/remove game app process's cmdline(/proc/<pid>/cmdline) in game list array.*/
+char *gamelist[] = {
+	"zo.wz.xingd.nearme.gamecenter",
+	"com.zsfz.klzsmn3d.nearme.gamecenter",
+	"zo.wz.xingd.m4399",
+	"com.jsdw.zzxdongjiB.nearme.gamecenter",
+	"com.tencent.tmgp.ffom",
+	"es.socialpoint.dragonland",
+	"com.gaeagame.cn.xj",
+	"com.gaea.xianjian.nearme.gamecenter",
+	"com.nintendo.zara",
+	NULL
+};
+
+static int current_in_list(void)
+{
+	int i = 0;
+	char cmdline[128] = {0};
+
+	get_process_name(cmdline, sizeof(cmdline) - 1);
+	while (gamelist[i] != NULL) {
+		if (!strcmp(gamelist[i], cmdline)) {
+			return 1;
+		}
+		i++;
+	}
+	return 0;
+}
+
+/* Game app’s Unity engine reads CPU max frequency. If CPU max frequency
+   is bigger than "2419200KB", return value "2419200KB" to Unity.*/
+
+#define show_cpuinfo_max_freq(file_name, object)			\
+static ssize_t show_##file_name					        \
+(struct cpufreq_policy *policy, char *buf)				\
+{									\
+									\
+	unsigned int cur = policy->object;				\
+	if (cur > 2419200 && current_in_list()) {			\
+		cur = 2419200;						\
+	}								\
+	return snprintf(buf, 4096, "%u\n", cur);			\
+}
+
 
 #define show_one(file_name, object)			\
 static ssize_t show_##file_name				\
@@ -658,39 +725,10 @@ static ssize_t show_##file_name				\
 }
 
 show_one(cpuinfo_min_freq, cpuinfo.min_freq);
+show_cpuinfo_max_freq(cpuinfo_max_freq, cpuinfo.max_freq);
 show_one(cpuinfo_transition_latency, cpuinfo.transition_latency);
 show_one(scaling_min_freq, min);
 show_one(scaling_max_freq, max);
-
-unsigned int cpuinfo_max_freq_cached;
-
-static bool should_use_cached_freq(int cpu)
-{
-	/* This is a safe check. may not be needed */
-	if (!cpuinfo_max_freq_cached)
-		return false;
-
-	/*
-	 * perfd already configure sched_lib_mask_force to
-	 * 0xf0 from user space. so re-using it.
-	 */
-	if (!(BIT(cpu) & sched_lib_mask_force))
-		return false;
-
-	return is_sched_lib_based_app(current->pid);
-}
-
-static ssize_t show_cpuinfo_max_freq(struct cpufreq_policy *policy, char *buf)
-{
-	unsigned int freq = policy->cpuinfo.max_freq;
-
-	if (should_use_cached_freq(policy->cpu))
-		freq = cpuinfo_max_freq_cached << 1;
-	else
-		freq = policy->cpuinfo.max_freq;
-
-	return scnprintf(buf, PAGE_SIZE, "%u\n", freq);
-}
 
 __weak unsigned int arch_freq_get_on_cpu(int cpu)
 {
